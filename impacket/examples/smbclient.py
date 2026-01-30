@@ -93,20 +93,58 @@ class DFSConnectionManager:
 
         return server, share, remaining_path
 
-    def resolve_dfs_path(self, dfs_path):
+    def resolve_dfs_path(self, dfs_path, max_depth=5, _visited=None):
         """
         Resolve a DFS path to actual (server, share, path).
+        Handles recursive DFS referrals with loop detection.
 
         :param dfs_path: Full DFS path
+        :param max_depth: Maximum recursion depth for nested DFS referrals
+        :param _visited: Internal set of visited paths (for loop detection)
         :return: (server, share, path) tuple or None
         """
+        if _visited is None:
+            _visited = set()
+
+        # Normalize path for comparison
+        normalized_path = dfs_path.lower().rstrip('\\')
+
+        # Check for loops and depth limit
+        if normalized_path in _visited:
+            LOG.warning("DFS loop detected at: %s" % dfs_path)
+            return None
+        if max_depth <= 0:
+            LOG.warning("DFS max depth exceeded at: %s" % dfs_path)
+            return None
+
+        _visited.add(normalized_path)
+
         try:
             referral = self.primary.getDfsReferral(dfs_path)
             if referral and referral.get('referrals'):
                 target = referral['referrals'][0]['network_address']
-                return self.parse_unc_path(target)
-        except:
-            pass
+                server, share, path = self.parse_unc_path(target)
+
+                if server is None:
+                    return None
+
+                # Check if target is also a DFS link (nested DFS)
+                # Try to get referral for the target to see if it's another DFS link
+                try:
+                    conn = self.get_connection(server)
+                    target_full_path = "\\\\%s\\%s%s" % (server, share, path if path != '\\' else '')
+                    nested_referral = conn.getDfsReferral(target_full_path)
+                    if nested_referral and nested_referral.get('referrals'):
+                        # It's a nested DFS link, resolve recursively
+                        nested_target = nested_referral['referrals'][0]['network_address']
+                        return self.resolve_dfs_path(nested_target, max_depth - 1, _visited)
+                except:
+                    # Not a DFS link or error - return the current target
+                    pass
+
+                return server, share, path
+        except Exception as e:
+            LOG.debug("DFS referral failed for %s: %s" % (dfs_path, str(e)))
         return None
 
     def close_all(self):
