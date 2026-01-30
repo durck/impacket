@@ -26,7 +26,7 @@ import logging
 import argparse
 from impacket.examples import logger
 from impacket.examples.utils import parse_target
-from impacket.examples.smbclient import MiniImpacketShell
+from impacket.examples.smbclient import MiniImpacketShell, DFSConnectionManager
 from impacket import version
 from impacket.smbconnection import SMBConnection
 
@@ -61,6 +61,10 @@ def main():
                             'This is useful when target is the NetBIOS name and you cannot resolve it')
     group.add_argument('-port', choices=['139', '445'], nargs='?', default='445', metavar="destination port",
                        help='Destination port to connect to SMB Server')
+
+    group = parser.add_argument_group('DFS')
+    group.add_argument('-dfs-follow', action='store_true',
+                       help='Automatically follow DFS links when navigating (cd). Shows DFS targets with ls.')
 
     if len(sys.argv)==1:
         parser.print_help()
@@ -99,6 +103,14 @@ def main():
             smbClient.login(username, password, domain, lmhash, nthash)
 
         shell = MiniImpacketShell(smbClient, None, options.outputfile)
+
+        # Configure DFS support
+        if options.dfs_follow:
+            shell.dfs_follow = True
+            shell.dfs_manager = DFSConnectionManager(
+                smbClient, username, password, domain, lmhash, nthash,
+                aesKey=options.aesKey, doKerberos=options.k, kdcHost=options.dc_ip
+            )
 
         if options.outputfile is not None:
             f = open(options.outputfile, 'a')

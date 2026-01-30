@@ -873,7 +873,7 @@ class SharedDevice:
 
 # Contains information about the shared file/directory
 class SharedFile:
-    def __init__(self, ctime, atime, wtime, mtime, filesize, allocsize, attribs, shortname, longname):
+    def __init__(self, ctime, atime, wtime, mtime, filesize, allocsize, attribs, shortname, longname, reparse_tag=0):
         self.__ctime = ctime # CreateTime ([MS-CIFS] 2.2.8.1.4 SMB_FIND_FILE_DIRECTORY_INFO)
         self.__atime = atime # LastAccessTime ([MS-CIFS] 2.2.8.1.4 SMB_FIND_FILE_DIRECTORY_INFO)
         self.__wtime = wtime # LastWriteTime ([MS-CIFS] 2.2.8.1.4 SMB_FIND_FILE_DIRECTORY_INFO)
@@ -881,6 +881,7 @@ class SharedFile:
         self.__filesize = filesize
         self.__allocsize = allocsize
         self.__attribs = attribs
+        self.__reparse_tag = reparse_tag
         try:
             if isinstance(shortname,bytes):
                 self.__shortname = shortname[:shortname.index(b'\0')]
@@ -952,6 +953,15 @@ class SharedFile:
 
     def is_system(self):
         return self.__attribs & ATTR_SYSTEM
+
+    def is_reparse_point(self):
+        return self.__attribs & 0x00000400  # FILE_ATTRIBUTE_REPARSE_POINT
+
+    def is_dfs_link(self):
+        return self.is_reparse_point() and self.__reparse_tag == 0x8000000A  # IO_REPARSE_TAG_DFS
+
+    def get_reparse_tag(self):
+        return self.__reparse_tag
 
     def get_shortname(self):
         return self.__shortname

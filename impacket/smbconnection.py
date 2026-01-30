@@ -966,6 +966,49 @@ class SMBConnection:
 
         self.closeFile(tid, fid)
 
+    def getDfsReferral(self, path, treeId=None):
+        """
+        Get DFS referral information for a path.
+
+        :param str path: DFS path to resolve (e.g., \\\\server\\share\\folder)
+        :param optional int treeId: Tree ID to use (if None, will connect to IPC$)
+
+        :return: Dict with 'path_consumed' and 'referrals' list
+        :raise SessionError: If encountered an error.
+        """
+        # Verify we're under SMB2+ session
+        if self.getDialect() == smb.SMB_DIALECT:
+            raise SessionError(error=nt_errors.STATUS_NOT_SUPPORTED)
+
+        disconnectTree = False
+        try:
+            if treeId is None:
+                treeId = self.connectTree('IPC$')
+                disconnectTree = True
+
+            try:
+                return self._SMBConnection.getDfsReferral(treeId, path)
+            finally:
+                if disconnectTree:
+                    self.disconnectTree(treeId)
+        except (smb.SessionError, smb3.SessionError) as e:
+            raise SessionError(e.get_error_code(), e.get_error_packet())
+
+    def isDfsShare(self, treeId):
+        """
+        Check if a connected tree is a DFS share.
+
+        :param int treeId: Tree ID to check
+        :return: True if the share is a DFS share
+        """
+        if self.getDialect() == smb.SMB_DIALECT:
+            return False
+
+        try:
+            return self._SMBConnection._Session['TreeConnectTable'][treeId].get('IsDfsShare', False)
+        except:
+            return False
+
     def rename(self, shareName, oldPath, newPath):
         """
         Renames a file/directory.

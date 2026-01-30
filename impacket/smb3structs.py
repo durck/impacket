@@ -308,9 +308,16 @@ FSCTL_DELETE_REPARSE_POINT           = 0x000900AC
 FSCTL_DFS_GET_REFERRALS_EX           = 0x000601B0
 FSCTL_FILE_LEVEL_TRIM                = 0x00098208
 FSCTL_VALIDATE_NEGOTIATE_INFO        = 0x00140204
+FSCTL_GET_REPARSE_POINT              = 0x000900A8
 
 # Flags
 SMB2_0_IOCTL_IS_FSCTL  = 0x1
+
+# IO Reparse Tags (MS-FSCC 2.1.2.1)
+IO_REPARSE_TAG_DFS                   = 0x8000000A
+IO_REPARSE_TAG_DFSR                  = 0x80000012
+IO_REPARSE_TAG_SYMLINK               = 0xA000000C
+IO_REPARSE_TAG_MOUNT_POINT           = 0xA0000003
 
 # SRV_READ_HASH
 # Type
@@ -1590,3 +1597,36 @@ class FileSecInformation(Structure):
         ('OffsetToSACL','<I=0'),
         ('OffsetToDACL','<I=0'),
     )
+
+# DFS Referral Request (MS-DFSC 2.2.2)
+class REQ_GET_DFS_REFERRAL(Structure):
+    structure = (
+        ('MaxReferralLevel','<H=3'),
+        ('_RequestFileName','_-RequestFileName','len(self["RequestFileName"])'),
+        ('RequestFileName',':'),
+    )
+
+# DFS Referral Response Header (MS-DFSC 2.2.3)
+class RESP_GET_DFS_REFERRAL(Structure):
+    structure = (
+        ('PathConsumed','<H=0'),
+        ('NumberOfReferrals','<H=0'),
+        ('ReferralHeaderFlags','<L=0'),
+    )
+
+# DFS Referral Entry v3 (MS-DFSC 2.2.5.3)
+class DFS_REFERRAL_V3(Structure):
+    structure = (
+        ('VersionNumber','<H=3'),
+        ('Size','<H=0'),
+        ('ServerType','<H=0'),
+        ('ReferralEntryFlags','<H=0'),
+        ('TimeToLive','<L=0'),
+        ('DFSPathOffset','<H=0'),
+        ('DFSAlternatePathOffset','<H=0'),
+        ('NetworkAddressOffset','<H=0'),
+        ('ServiceSiteGuid','16s=""'),
+    )
+
+# DFS Referral Entry v4 (MS-DFSC 2.2.5.4) - same as v3 but with additional flags
+DFS_REFERRAL_V4 = DFS_REFERRAL_V3

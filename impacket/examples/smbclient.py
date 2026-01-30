@@ -35,6 +35,90 @@ from impacket.smbconnection import SMBConnection, SMB2_DIALECT_002, SMB2_DIALECT
 from impacket.smb3structs import FILE_DIRECTORY_FILE, FILE_LIST_DIRECTORY
 
 import charset_normalizer as chardet
+import re
+
+
+class DFSConnectionManager:
+    """Manages multiple SMB connections for DFS navigation"""
+
+    def __init__(self, primary_connection, username, password, domain, lmhash, nthash, aesKey=None, doKerberos=False, kdcHost=None):
+        self.connections = {}  # server -> (SMBConnection, tree_id, share_name)
+        self.primary = primary_connection
+        self.primary_host = primary_connection.getRemoteHost()
+        self.username = username
+        self.password = password
+        self.domain = domain
+        self.lmhash = lmhash
+        self.nthash = nthash
+        self.aesKey = aesKey
+        self.doKerberos = doKerberos
+        self.kdcHost = kdcHost
+
+    def get_connection(self, server):
+        """Get or create connection to a server"""
+        server_lower = server.lower()
+        if server_lower == self.primary_host.lower():
+            return self.primary
+        if server_lower in self.connections:
+            return self.connections[server_lower][0]
+
+        # Create new connection
+        conn = SMBConnection(server, server)
+        if self.doKerberos:
+            conn.kerberosLogin(self.username, self.password, self.domain,
+                             self.lmhash, self.nthash, self.aesKey, self.kdcHost)
+        else:
+            conn.login(self.username, self.password, self.domain, self.lmhash, self.nthash)
+
+        self.connections[server_lower] = (conn, None, None)
+        return conn
+
+    def parse_unc_path(self, unc_path):
+        """
+        Parse a UNC path into (server, share, path) components.
+
+        :param unc_path: UNC path like \\\\server\\share\\path
+        :return: (server, share, path) tuple
+        """
+        # Remove leading backslashes and normalize
+        path = unc_path.lstrip('\\')
+        parts = path.split('\\')
+
+        if len(parts) < 2:
+            return None, None, None
+
+        server = parts[0]
+        share = parts[1]
+        remaining_path = '\\' + '\\'.join(parts[2:]) if len(parts) > 2 else '\\'
+
+        return server, share, remaining_path
+
+    def resolve_dfs_path(self, dfs_path):
+        """
+        Resolve a DFS path to actual (server, share, path).
+
+        :param dfs_path: Full DFS path
+        :return: (server, share, path) tuple or None
+        """
+        try:
+            referral = self.primary.getDfsReferral(dfs_path)
+            if referral and referral.get('referrals'):
+                target = referral['referrals'][0]['network_address']
+                return self.parse_unc_path(target)
+        except:
+            pass
+        return None
+
+    def close_all(self):
+        """Close all managed connections"""
+        for server, (conn, tid, share) in self.connections.items():
+            try:
+                if tid:
+                    conn.disconnectTree(tid)
+                conn.close()
+            except:
+                pass
+        self.connections.clear()
 
 
 class MiniImpacketShell(cmd.Cmd):
@@ -64,6 +148,10 @@ class MiniImpacketShell(cmd.Cmd):
         self.last_output = None
         self.completion = []
         self.outputfile = outputfile
+        # DFS support
+        self.dfs_follow = False
+        self.dfs_manager = None
+        self._dfs_referral_cache = {}  # Cache for DFS referrals
 
     def emptyline(self):
         pass
@@ -125,6 +213,7 @@ class MiniImpacketShell(cmd.Cmd):
  mount {target,path} - creates a mount point from {path} to {target} (admin required)
  umount {path} - removes the mount point at {path} without deleting the directory (admin required)
  list_snapshots {path} - lists the vss snapshots for the specified path
+ dfs_info {path} - shows DFS referral information for the specified path
  info - returns NetrServerInfo main results
  who - returns the sessions currently connected at the target host (admin required)
  close - closes the current SMB Session
@@ -360,11 +449,39 @@ class MiniImpacketShell(cmd.Cmd):
             return
         p = line.replace('/','\\')
         oldpwd = self.pwd
+        old_smb = self.smb
+        old_tid = self.tid
+        old_share = self.share
+
         if p[0] == '\\':
            self.pwd = line
         else:
            self.pwd = ntpath.join(self.pwd, line)
         self.pwd = ntpath.normpath(self.pwd)
+
+        # Check if target is DFS link and dfs_follow is enabled
+        if self.dfs_follow and self.dfs_manager:
+            try:
+                # Check if the target directory is a DFS link
+                target = self._get_dfs_target(line)
+                if target:
+                    # Parse the DFS target path
+                    server, share, path = self.dfs_manager.parse_unc_path(target)
+                    if server and share:
+                        LOG.info("Following DFS link to %s" % target)
+                        # Get connection to target server
+                        new_conn = self.dfs_manager.get_connection(server)
+                        new_tid = new_conn.connectTree(share)
+                        # Successfully connected, update state
+                        self.smb = new_conn
+                        self.tid = new_tid
+                        self.share = share
+                        self.pwd = path if path else '\\'
+                        return
+            except Exception as e:
+                LOG.debug("DFS follow failed: %s" % str(e))
+                # Continue with normal cd
+
         # Let's try to open the directory to see if it's valid
         try:
             fid = self.smb.openFile(self.tid, self.pwd, creationOption = FILE_DIRECTORY_FILE, desiredAccess = FILE_READ_DATA |
@@ -372,6 +489,9 @@ class MiniImpacketShell(cmd.Cmd):
             self.smb.closeFile(self.tid,fid)
         except SessionError:
             self.pwd = oldpwd
+            self.smb = old_smb
+            self.tid = old_tid
+            self.share = old_share
             raise
 
     def do_lcd(self, s):
@@ -409,17 +529,62 @@ class MiniImpacketShell(cmd.Cmd):
             of = open(self.outputfile, 'a')
         for f in self.smb.listPath(self.share, pwd):
             if display is True:
+                # Determine file type character
+                if f.is_directory():
+                    type_char = 'd'
+                elif f.is_dfs_link():
+                    type_char = 'l'
+                elif f.is_reparse_point():
+                    type_char = 'j'  # junction/symlink
+                else:
+                    type_char = '-'
+
+                line = "%crw-rw-rw- %10d  %s %s" % (
+                    type_char, f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
+                    f.get_longname())
+
+                # For DFS links, show target path
+                if f.is_dfs_link():
+                    target = self._get_dfs_target(f.get_longname())
+                    if target:
+                        line += " -> %s" % target
+                    else:
+                        line += " [DFS]"
+
                 if self.outputfile:
-                    of.write("%crw-rw-rw- %10d  %s %s" % (
-                    'd' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
-                    f.get_longname()) + "\n")
-                
-                print("%crw-rw-rw- %10d  %s %s" % (
-                'd' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
-                f.get_longname()))
+                    of.write(line + "\n")
+                print(line)
             self.completion.append((f.get_longname(), f.is_directory()))
         if self.outputfile:
             of.close()
+
+    def _get_dfs_target(self, filename):
+        """Get DFS target path for a file. Returns None if not available."""
+        try:
+            # Build full DFS path
+            full_path = '\\\\' + self.smb.getRemoteHost() + '\\' + self.share
+            file_path = ntpath.join(self.pwd, filename)
+            if file_path.startswith('\\'):
+                full_path += file_path
+            else:
+                full_path += '\\' + file_path
+
+            # Check cache first
+            if full_path in self._dfs_referral_cache:
+                cached = self._dfs_referral_cache[full_path]
+                if cached['referrals']:
+                    return cached['referrals'][0]['network_address']
+                return None
+
+            # Get DFS referral
+            referral = self.smb.getDfsReferral(full_path)
+            self._dfs_referral_cache[full_path] = referral
+
+            if referral and referral['referrals']:
+                return referral['referrals'][0]['network_address']
+        except Exception:
+            pass
+        return None
     
     def do_lls(self, currentDir):
         if currentDir == "":
@@ -647,6 +812,41 @@ class MiniImpacketShell(cmd.Cmd):
 
         for timestamp in snapshotList:
             print(timestamp)
+
+    def do_dfs_info(self, line):
+        """Show DFS referral information for a path"""
+        if self.loggedIn is False:
+            LOG.error("Not logged in")
+            return
+
+        path = line.strip() if line.strip() else ''
+
+        # Build full DFS path
+        full_path = '\\\\' + self.smb.getRemoteHost() + '\\' + (self.share or '')
+        if path:
+            path = path.replace('/', '\\')
+            if not path.startswith('\\'):
+                path = ntpath.join(self.pwd, path)
+            full_path += path
+        elif self.pwd:
+            full_path += self.pwd
+
+        try:
+            referral = self.smb.getDfsReferral(full_path)
+            print("DFS Referral for: %s" % full_path)
+            print("Path consumed: %d characters" % referral.get('path_consumed', 0))
+            print("")
+            if referral.get('referrals'):
+                print("Targets:")
+                for i, ref in enumerate(referral['referrals']):
+                    server_type = ref.get('server_type', 'unknown')
+                    ttl = ref.get('ttl', 0)
+                    network_addr = ref.get('network_address', 'N/A')
+                    print("  [%d] %s (%s, TTL=%ds)" % (i+1, network_addr, server_type, ttl))
+            else:
+                print("No referrals found (path may not be a DFS link)")
+        except Exception as e:
+            LOG.error("Failed to get DFS referral: %s" % str(e))
 
     def do_mount(self, line):
         l = line.split(' ')

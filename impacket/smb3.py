@@ -1547,6 +1547,107 @@ class SMB3:
             smbIoctlResponse = SMB2Ioctl_Response(ans['Data'])
             return smbIoctlResponse['Buffer']
 
+    def getDfsReferral(self, treeId, path, maxReferralLevel=3):
+        """
+        Get DFS referral information for a path.
+
+        :param treeId: Tree ID (should be IPC$ or DFS share tree)
+        :param path: DFS path to resolve (e.g., \\\\domain\\dfsroot\\link)
+        :param maxReferralLevel: Max referral version (default 3)
+        :return: Parsed DFS referral response dict with 'path_consumed' and 'referrals' list
+        """
+        # Build DFS referral request
+        request = REQ_GET_DFS_REFERRAL()
+        request['MaxReferralLevel'] = maxReferralLevel
+        request['RequestFileName'] = (path + '\x00').encode('utf-16le')
+
+        response = self.ioctl(treeId, fileId=None,
+                             ctlCode=FSCTL_DFS_GET_REFERRALS,
+                             flags=SMB2_0_IOCTL_IS_FSCTL,
+                             inputBlob=request.getData(),
+                             maxInputResponse=0,
+                             maxOutputResponse=65535)
+
+        return self._parseDfsReferral(response)
+
+    def _parseDfsReferral(self, data):
+        """
+        Parse DFS referral response into structured data.
+
+        :param data: Raw response buffer from FSCTL_DFS_GET_REFERRALS
+        :return: Dict with 'path_consumed' and 'referrals' list
+        """
+        if len(data) < 8:
+            return {'path_consumed': 0, 'referrals': []}
+
+        header = RESP_GET_DFS_REFERRAL(data[:8])
+        referrals = []
+        offset = 8  # After header
+
+        for i in range(header['NumberOfReferrals']):
+            if offset + 2 > len(data):
+                break
+
+            # Check version number to determine structure size
+            version = struct.unpack('<H', data[offset:offset+2])[0]
+
+            if version == 3 or version == 4:
+                if offset + 34 > len(data):
+                    break
+                entry = DFS_REFERRAL_V3(data[offset:offset+34])
+                entry_size = entry['Size'] if entry['Size'] > 0 else 34
+
+                # Extract strings from offsets relative to entry start
+                dfs_path = self._extractDfsString(data, offset, entry['DFSPathOffset'])
+                alternate_path = self._extractDfsString(data, offset, entry['DFSAlternatePathOffset'])
+                network_address = self._extractDfsString(data, offset, entry['NetworkAddressOffset'])
+
+                referral = {
+                    'version': entry['VersionNumber'],
+                    'server_type': 'root' if entry['ServerType'] == 1 else 'link',
+                    'ttl': entry['TimeToLive'],
+                    'dfs_path': dfs_path,
+                    'alternate_path': alternate_path,
+                    'network_address': network_address,
+                }
+                referrals.append(referral)
+                offset += entry_size
+            else:
+                # Unsupported version, skip
+                break
+
+        return {
+            'path_consumed': header['PathConsumed'],
+            'referrals': referrals
+        }
+
+    def _extractDfsString(self, data, entryOffset, stringOffset):
+        """
+        Extract a null-terminated UTF-16LE string from DFS referral data.
+
+        :param data: Full response buffer
+        :param entryOffset: Offset of the referral entry
+        :param stringOffset: Offset from entry to the string
+        :return: Decoded string
+        """
+        if stringOffset == 0:
+            return ''
+        absOffset = entryOffset + stringOffset
+        if absOffset >= len(data):
+            return ''
+
+        # Find null terminator
+        end = absOffset
+        while end + 1 < len(data):
+            if data[end:end+2] == b'\x00\x00':
+                break
+            end += 2
+
+        try:
+            return data[absOffset:end].decode('utf-16le')
+        except:
+            return ''
+
     def flush(self,treeId, fileId):
         if (treeId in self._Session['TreeConnectTable']) is False:
             raise SessionError(STATUS_INVALID_PARAMETER)
@@ -1802,17 +1903,23 @@ class SMB3:
             from impacket import smb
             while True:
                 try:
+                    # Use FILEID_BOTH_DIRECTORY_INFORMATION to get EaSize which contains ReparseTag
                     res = self.queryDirectory(treeId, fileId, ntpath.basename(path), maxBufferSize=65535,
-                                              informationClass=FILE_FULL_DIRECTORY_INFORMATION)
+                                              informationClass=FILEID_BOTH_DIRECTORY_INFORMATION)
                     nextOffset = 1
                     while nextOffset != 0:
-                        fileInfo = smb.SMBFindFileFullDirectoryInfo(smb.SMB.FLAGS2_UNICODE)
+                        fileInfo = smb.SMBFindFileIdBothDirectoryInfo(smb.SMB.FLAGS2_UNICODE)
                         fileInfo.fromString(res)
+                        # EaSize contains ReparseTag when FILE_ATTRIBUTE_REPARSE_POINT is set
+                        reparse_tag = 0
+                        if fileInfo['ExtFileAttributes'] & 0x00000400:  # FILE_ATTRIBUTE_REPARSE_POINT
+                            reparse_tag = fileInfo['EaSize']
                         files.append(smb.SharedFile(fileInfo['CreationTime'], fileInfo['LastAccessTime'],
                                                     fileInfo['LastWriteTime'], fileInfo['LastChangeTime'], fileInfo['EndOfFile'],
                                                     fileInfo['AllocationSize'], fileInfo['ExtFileAttributes'],
                                                     fileInfo['FileName'].decode('utf-16le'),
-                                                    fileInfo['FileName'].decode('utf-16le')))
+                                                    fileInfo['FileName'].decode('utf-16le'),
+                                                    reparse_tag))
                         nextOffset = fileInfo['NextEntryOffset']
                         res = res[nextOffset:]
                 except SessionError as e:
