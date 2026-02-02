@@ -190,6 +190,22 @@ class MiniImpacketShell(cmd.Cmd):
         self.dfs_follow = False
         self.dfs_manager = None
         self._dfs_referral_cache = {}  # Cache for DFS referrals
+        self._dfs_hostname = None  # Cached DFS hostname
+
+    def _get_dfs_hostname(self):
+        """Get the hostname to use for DFS paths. Prefers DNS hostname over IP."""
+        if self._dfs_hostname is None:
+            # Try DNS hostname first (required for DFS referrals)
+            dns_hostname = self.smb.getServerDNSHostName()
+            dns_domain = self.smb.getServerDNSDomainName()
+            if dns_hostname and dns_domain:
+                self._dfs_hostname = dns_hostname + '.' + dns_domain
+            elif dns_hostname:
+                self._dfs_hostname = dns_hostname
+            else:
+                # Fallback to remote host
+                self._dfs_hostname = self.smb.getRemoteHost()
+        return self._dfs_hostname
 
     def emptyline(self):
         pass
@@ -599,8 +615,8 @@ class MiniImpacketShell(cmd.Cmd):
     def _get_dfs_target(self, filename):
         """Get DFS target path for a file. Returns None if not available."""
         try:
-            # Build full DFS path
-            full_path = '\\\\' + self.smb.getRemoteHost() + '\\' + self.share
+            # Build full DFS path using DNS hostname (required for DFS)
+            full_path = '\\\\' + self._get_dfs_hostname() + '\\' + self.share
             file_path = ntpath.join(self.pwd, filename)
             if file_path.startswith('\\'):
                 full_path += file_path
@@ -859,8 +875,8 @@ class MiniImpacketShell(cmd.Cmd):
 
         path = line.strip() if line.strip() else ''
 
-        # Build full DFS path
-        full_path = '\\\\' + self.smb.getRemoteHost() + '\\' + (self.share or '')
+        # Build full DFS path using DNS hostname (required for DFS)
+        full_path = '\\\\' + self._get_dfs_hostname() + '\\' + (self.share or '')
         if path:
             path = path.replace('/', '\\')
             if not path.startswith('\\'):
